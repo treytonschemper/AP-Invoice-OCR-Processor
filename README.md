@@ -179,7 +179,7 @@ This tool requires a Google Cloud Vision API key. To set up:
 ## 📞 Contact
 **Treyton Schemper, CPA**
 - Email: Treyton.Schemper@gmail.com
-- LinkedIn: [Your LinkedIn URL]
+- LinkedIn: https://www.linkedin.com/in/trey-schemper-cpa-2a07ab11b/
 - GitHub: [@treytonschemper](https://github.com/treytonschemper)
 
 ## 🎯 Development Background
