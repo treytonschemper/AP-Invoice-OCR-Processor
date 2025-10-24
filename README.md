@@ -92,6 +92,16 @@ Manual invoice data entry is time-consuming, error-prone, and costly for busines
 - Click "Process with Google Vision" button
 - Watch real-time progress indicators
 - System automatically extracts data from each invoice
+-  ## ⚙️ Configuration Requirements
+
+   ### Google Vision API Key
+   This tool requires a Google Cloud Vision API key. To set up:
+   1. Create a Google Cloud account at https://console.cloud.google.com
+   2. Enable Vision API
+   3. Generate an API key
+   4. Replace 'YOUR_API_KEY_HERE' on line 11 of index.html with your key
+
+   **For Employers**: A live demo with working API integration is available upon request.
 
 ### 3. Review & Correct Data
 - Review the processed invoices list
