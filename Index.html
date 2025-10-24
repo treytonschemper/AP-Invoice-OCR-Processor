@@ -1,0 +1,1218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Google Vision Invoice Parser</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/lucide/0.263.1/lucide.min.css" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/lucide/0.263.1/lucide.min.js"></script>
+</head>
+<body class="bg-gray-50">
+    <div id="app"></div>
+
+    <script>
+        const GOOGLE_VISION_API_KEY = 'AIzaSyC9hwtjwz7dlSm-feOOWi7qH6QEDrf6IBU';
+        const VISION_API_URL = `https://vision.googleapis.com/v1/images:annotate?key=${GOOGLE_VISION_API_KEY}`;
+
+        let nextId = 1000; // Start with whole numbers
+
+        let state = {
+            activeTab: 'upload',
+            uploadedFiles: [],
+            invoices: [],
+            selectedInvoice: null,
+            processingFiles: false,
+            processingProgress: {},
+            exportTemplate: [
+                { id: nextId++, excelColumn: 'Record ID', invoiceField: 'recordId', defaultValue: '' },
+                { id: nextId++, excelColumn: 'Vendor Code', invoiceField: 'vendorCode', defaultValue: '' },
+                { id: nextId++, excelColumn: 'Invoice Total', invoiceField: 'totalAmount', defaultValue: '' },
+                { id: nextId++, excelColumn: 'Invoice Number', invoiceField: 'invoiceNumber', defaultValue: '' },
+                { id: nextId++, excelColumn: 'Invoice Date', invoiceField: 'invoiceDate', defaultValue: '' },
+                { id: nextId++, excelColumn: 'Due Date', invoiceField: 'dueDate', defaultValue: '' },
+                { id: nextId++, excelColumn: 'GL Account', invoiceField: 'glAccount', defaultValue: '' },
+                { id: nextId++, excelColumn: 'Area Code', invoiceField: 'areaCode', defaultValue: '' },
+                { id: nextId++, excelColumn: 'Discount Amount', invoiceField: 'discountAmount', defaultValue: '' },
+            ],
+            learningData: JSON.parse(localStorage.getItem('invoiceLearningData') || '{}'),
+            duplicateHistory: JSON.parse(localStorage.getItem('invoiceDuplicateHistory') || '{}')
+        };
+
+        const availableFields = [
+            { value: '', label: '-- Select Field --' },
+            { value: 'recordId', label: 'Record ID (Auto-generated)' },
+            { value: 'vendorName', label: 'Vendor Name (Internal)' },
+            { value: 'vendorCode', label: 'Vendor Code' },
+            { value: 'invoiceNumber', label: 'Invoice Number' },
+            { value: 'invoiceDate', label: 'Invoice Date' },
+            { value: 'dueDate', label: 'Due Date' },
+            { value: 'totalAmount', label: 'Total Amount' },
+            { value: 'glAccount', label: 'GL Account' },
+            { value: 'areaCode', label: 'Area Code' },
+            { value: 'discountAmount', label: 'Discount Amount' },
+        ];
+
+        function saveLearningData() {
+            localStorage.setItem('invoiceLearningData', JSON.stringify(state.learningData));
+        }
+
+        function saveDuplicateHistory() {
+            localStorage.setItem('invoiceDuplicateHistory', JSON.stringify(state.duplicateHistory));
+        }
+
+        function addToHistoricalDuplicates(invoiceNumber, totalAmount) {
+            if (!invoiceNumber || !totalAmount) return;
+            
+            const key = `${invoiceNumber}-${totalAmount}`;
+            state.duplicateHistory[key] = new Date().toISOString().split('T')[0];
+            saveDuplicateHistory();
+        }
+
+        function isHistoricalDuplicate(invoiceNumber, totalAmount) {
+            if (!invoiceNumber || !totalAmount) return false;
+            
+            const key = `${invoiceNumber}-${totalAmount}`;
+            return state.duplicateHistory.hasOwnProperty(key);
+        }
+
+        function clearDuplicateHistory() {
+            const count = Object.keys(state.duplicateHistory).length;
+            if (count === 0) {
+                alert('No duplicate history to clear!');
+                return;
+            }
+            
+            if (confirm(`Are you sure you want to clear the duplicate history containing ${count} processed invoices? This will allow those invoices to be processed again.`)) {
+                state.duplicateHistory = {};
+                saveDuplicateHistory();
+                render();
+                alert('Duplicate history cleared successfully!');
+            }
+        }
+
+        function parseDate(dateStr) {
+            if (!dateStr) return null;
+            
+            // Try various date formats
+            const formats = [
+                /(\d{1,2})[-\/](\d{1,2})[-\/](\d{2,4})/,  // MM/DD/YYYY or DD/MM/YYYY
+                /(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/     // YYYY/MM/DD
+            ];
+            
+            for (let format of formats) {
+                const match = dateStr.match(format);
+                if (match) {
+                    let [, part1, part2, part3] = match;
+                    
+                    // Assume MM/DD/YYYY format for now
+                    if (part3.length === 4) {
+                        return new Date(part3, part1 - 1, part2);
+                    } else {
+                        // Handle 2-digit years
+                        const year = parseInt(part3) + (parseInt(part3) > 50 ? 1900 : 2000);
+                        return new Date(year, part1 - 1, part2);
+                    }
+                }
+            }
+            return null;
+        }
+
+        function formatDate(date) {
+            if (!date || isNaN(date.getTime())) return '';
+            return `${(date.getMonth() + 1).toString().padStart(2, '0')}/${date.getDate().toString().padStart(2, '0')}/${date.getFullYear()}`;
+        }
+
+        function detectDueDatePattern(invoiceDate, dueDate) {
+            const invDate = parseDate(invoiceDate);
+            const dueDateParsed = parseDate(dueDate);
+            
+            if (!invDate || !dueDateParsed) return null;
+            
+            // Check if due date equals invoice date (upon receipt)
+            if (invDate.getTime() === dueDateParsed.getTime()) {
+                return { type: 'upon_receipt' };
+            }
+            
+            // Check if it's a fixed day of next month
+            const nextMonth = new Date(invDate.getFullYear(), invDate.getMonth() + 1, dueDateParsed.getDate());
+            if (Math.abs(nextMonth.getTime() - dueDateParsed.getTime()) < 24 * 60 * 60 * 1000) {
+                return { type: 'fixed_day', day: dueDateParsed.getDate(), nextMonth: true };
+            }
+            
+            // Check if it's a fixed day of same month
+            const sameMonth = new Date(invDate.getFullYear(), invDate.getMonth(), dueDateParsed.getDate());
+            if (Math.abs(sameMonth.getTime() - dueDateParsed.getTime()) < 24 * 60 * 60 * 1000) {
+                return { type: 'fixed_day', day: dueDateParsed.getDate(), nextMonth: false };
+            }
+            
+            // Check if it's X days from invoice date
+            const daysDiff = Math.round((dueDateParsed.getTime() - invDate.getTime()) / (24 * 60 * 60 * 1000));
+            if (daysDiff > 0 && daysDiff <= 90) {
+                return { type: 'days_from_invoice', days: daysDiff };
+            }
+            
+            return null; // Unrecognized pattern
+        }
+
+        function calculateDueDate(invoiceDate, pattern) {
+            if (!pattern || !invoiceDate) return '';
+            
+            const invDate = parseDate(invoiceDate);
+            if (!invDate) return '';
+            
+            switch (pattern.type) {
+                case 'upon_receipt':
+                    return formatDate(invDate);
+                    
+                case 'fixed_day':
+                    const targetMonth = pattern.nextMonth ? invDate.getMonth() + 1 : invDate.getMonth();
+                    const targetYear = pattern.nextMonth && targetMonth > 11 ? invDate.getFullYear() + 1 : invDate.getFullYear();
+                    const adjustedMonth = targetMonth > 11 ? 0 : targetMonth;
+                    return formatDate(new Date(targetYear, adjustedMonth, pattern.day));
+                    
+                case 'days_from_invoice':
+                    const dueDate = new Date(invDate);
+                    dueDate.setDate(dueDate.getDate() + pattern.days);
+                    return formatDate(dueDate);
+                    
+                default:
+                    return '';
+            }
+        }
+
+        function learnFromCorrection(originalText, invoice) {
+            const vendorName = invoice.vendorName;
+            if (!vendorName) return;
+
+            const key = vendorName;
+            
+            if (!state.learningData[key]) {
+                state.learningData[key] = {
+                    corrections: 0,
+                    invoiceNumberPatterns: [],
+                    vendorNamePatterns: [],
+                    vendorCode: '',
+                    glCodes: [],
+                    dueDatePattern: null,
+                    discountAmount: '',
+                    discountPercentage: ''
+                };
+            }
+
+            state.learningData[key].corrections++;
+
+            // Learn vendor code
+            if (invoice.vendorCode) {
+                state.learningData[key].vendorCode = invoice.vendorCode;
+            }
+
+            // Learn GL Account and Area Code
+            if (invoice.glAccount || invoice.areaCode) {
+                const glEntry = state.learningData[key].glCodes.find(
+                    entry => entry.glAccount === invoice.glAccount && entry.areaCode === invoice.areaCode
+                );
+                
+                if (glEntry) {
+                    glEntry.count++;
+                } else {
+                    state.learningData[key].glCodes.push({
+                        glAccount: invoice.glAccount || '',
+                        areaCode: invoice.areaCode || '',
+                        count: 1
+                    });
+                }
+
+                state.learningData[key].glCodes.sort((a, b) => b.count - a.count);
+            }
+
+            // Learn due date pattern
+            if (invoice.dueDate && invoice.invoiceDate) {
+                const pattern = detectDueDatePattern(invoice.invoiceDate, invoice.dueDate);
+                if (pattern) {
+                    state.learningData[key].dueDatePattern = pattern;
+                }
+            }
+
+            // Learn discount amount and percentage
+            if (invoice.discountAmount) {
+                state.learningData[key].discountAmount = invoice.discountAmount;
+            }
+            if (invoice.discountPercentage) {
+                state.learningData[key].discountPercentage = invoice.discountPercentage;
+            }
+
+            // Learn invoice number patterns
+            if (invoice.invoiceNumber) {
+                const lines = originalText.split('\n');
+                for (let i = 0; i < lines.length; i++) {
+                    if (lines[i].includes(invoice.invoiceNumber)) {
+                        const pattern = {
+                            lineIndex: i,
+                            surroundingText: lines[i],
+                            numberFormat: invoice.invoiceNumber.replace(/[0-9]/g, '#')
+                        };
+                        state.learningData[key].invoiceNumberPatterns.push(pattern);
+                        break;
+                    }
+                }
+            }
+
+            // Learn vendor name patterns
+            if (vendorName) {
+                const lines = originalText.split('\n');
+                for (let i = 0; i < Math.min(10, lines.length); i++) {
+                    if (lines[i].toLowerCase().includes(vendorName.toLowerCase().substring(0, 5))) {
+                        state.learningData[key].vendorNamePatterns.push({
+                            lineIndex: i,
+                            text: lines[i]
+                        });
+                        break;
+                    }
+                }
+            }
+
+            // Limit array sizes
+            if (state.learningData[key].invoiceNumberPatterns.length > 10) {
+                state.learningData[key].invoiceNumberPatterns = 
+                    state.learningData[key].invoiceNumberPatterns.slice(-10);
+            }
+            if (state.learningData[key].vendorNamePatterns.length > 10) {
+                state.learningData[key].vendorNamePatterns = 
+                    state.learningData[key].vendorNamePatterns.slice(-10);
+            }
+
+            saveLearningData();
+        }
+
+        function applyLearning(text, parsedData) {
+            for (let vendor in state.learningData) {
+                const learned = state.learningData[vendor];
+                
+                if (text.toLowerCase().includes(vendor.toLowerCase().substring(0, 5))) {
+                    
+                    // Apply learned vendor code
+                    if (learned.vendorCode) {
+                        parsedData.vendorCode = learned.vendorCode;
+                    }
+
+                    // Apply learned GL codes
+                    if (learned.glCodes && learned.glCodes.length > 0) {
+                        parsedData.glAccount = learned.glCodes[0].glAccount;
+                        parsedData.areaCode = learned.glCodes[0].areaCode;
+                    }
+
+                    // Apply learned due date pattern
+                    if (learned.dueDatePattern && parsedData.invoiceDate) {
+                        const calculatedDueDate = calculateDueDate(parsedData.invoiceDate, learned.dueDatePattern);
+                        if (calculatedDueDate) {
+                            parsedData.dueDate = calculatedDueDate;
+                        }
+                    }
+
+                    // Apply learned discount amount
+                    if (learned.discountAmount) {
+                        parsedData.discountAmount = learned.discountAmount;
+                    }
+                    if (learned.discountPercentage) {
+                        parsedData.discountPercentage = learned.discountPercentage;
+                    }
+
+                    // Apply learned invoice number patterns
+                    if (learned.invoiceNumberPatterns.length > 0) {
+                        const pattern = learned.invoiceNumberPatterns[learned.invoiceNumberPatterns.length - 1];
+                        const lines = text.split('\n');
+                        
+                        if (lines[pattern.lineIndex]) {
+                            const match = lines[pattern.lineIndex].match(/[A-Z0-9]{6,}/);
+                            if (match) {
+                                parsedData.invoiceNumber = match[0];
+                            }
+                        }
+                    }
+
+                    // Apply learned vendor name
+                    if (learned.vendorNamePatterns.length > 0) {
+                        parsedData.vendorName = vendor;
+                    }
+
+                    break;
+                }
+            }
+
+            return parsedData;
+        }
+
+        function isInvoiceComplete(invoice) {
+            return invoice.vendorName && 
+                   invoice.invoiceNumber && 
+                   invoice.totalAmount && 
+                   invoice.invoiceDate;
+        }
+
+        async function callGoogleVisionAPI(base64Image) {
+            const requestBody = {
+                requests: [{
+                    image: { content: base64Image },
+                    features: [{ type: 'DOCUMENT_TEXT_DETECTION' }]
+                }]
+            };
+
+            const response = await fetch(VISION_API_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(requestBody)
+            });
+
+            if (!response.ok) {
+                throw new Error(`Vision API error: ${response.status}`);
+            }
+
+            const data = await response.json();
+            return data.responses[0];
+        }
+
+        function fileToBase64(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => {
+                    const base64 = reader.result.split(',')[1];
+                    resolve(base64);
+                };
+                reader.onerror = reject;
+                reader.readAsDataURL(file);
+            });
+        }
+
+        function parseInvoiceData(text) {
+            const invoice = {
+                vendorName: '',
+                vendorCode: '',
+                invoiceNumber: '',
+                invoiceDate: '',
+                dueDate: '',
+                totalAmount: '',
+                glAccount: '',
+                areaCode: '',
+                discountAmount: '',
+                discountPercentage: ''
+            };
+
+            const lines = text.split('\n').filter(line => line.trim().length > 0);
+
+            // Parse vendor name
+            for (let i = 0; i < Math.min(10, lines.length); i++) {
+                const line = lines[i].trim();
+                if (line.length > 5 && 
+                    !line.match(/^(INVOICE|BILL|STATEMENT|TAX|RECEIPT|DATE|TOTAL|AMOUNT|DUE|NUMBER|#|TO:|FROM:)$/i) &&
+                    !line.match(/^(Invoice|Bill|Statement|Tax|Receipt|Date|Total|Amount|Due|Number)$/i)) {
+                    
+                    invoice.vendorName = line
+                        .replace(/^(Invoice|Bill|Statement|Tax|Receipt)\s+/i, '')
+                        .replace(/\s+(Invoice|Bill|Statement)$/i, '')
+                        .trim();
+                    
+                    if (invoice.vendorName.length > 2) {
+                        break;
+                    }
+                }
+            }
+
+            // Parse invoice number
+            const invoicePatterns = [
+                /Invoice\s*#[:\s]*([A-Z0-9-]+)/i,
+                /Invoice\s*Number[:\s]*([A-Z0-9-]+)/i,
+                /Inv[:\s#]+([A-Z0-9-]+)/i,
+                /Reference[:\s#]+([A-Z0-9-]+)/i,
+                /Ref[:\s#]+([A-Z0-9-]+)/i,
+                /#[:\s]*([A-Z0-9]{6,})/,
+            ];
+
+            for (let pattern of invoicePatterns) {
+                const match = text.match(pattern);
+                if (match && match[1] && match[1].length >= 4) {
+                    invoice.invoiceNumber = match[1].trim();
+                    break;
+                }
+            }
+
+            if (!invoice.invoiceNumber) {
+                const lines = text.split('\n');
+                for (let line of lines) {
+                    if (line.toLowerCase().includes('invoice')) {
+                        const match = line.match(/[A-Z0-9]{6,}/);
+                        if (match) {
+                            invoice.invoiceNumber = match[0];
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Parse dates
+            const dateMatches = text.match(/(\d{1,2}[-\/]\d{1,2}[-\/]\d{2,4})/g);
+            if (dateMatches && dateMatches.length > 0) {
+                invoice.invoiceDate = dateMatches[0];
+                // Don't auto-assign due date, let learning system handle it
+            }
+
+            // Parse total amount
+            const totalPatterns = [
+                /Total[:\s]*\$?([0-9,]+\.?\d{0,2})/i,
+                /Amount\s+Due[:\s]*\$?([0-9,]+\.?\d{0,2})/i,
+                /Balance[:\s]*\$?([0-9,]+\.?\d{0,2})/i,
+                /Grand\s+Total[:\s]*\$?([0-9,]+\.?\d{0,2})/i,
+                /Invoice\s+Total[:\s]*\$?([0-9,]+\.?\d{0,2})/i,
+            ];
+
+            for (let pattern of totalPatterns) {
+                const match = text.match(pattern);
+                if (match && match[1]) {
+                    invoice.totalAmount = match[1].replace(/,/g, '');
+                    break;
+                }
+            }
+
+            return applyLearning(text, invoice);
+        }
+
+        function checkDuplicate(invoiceNumber, totalAmount) {
+            // Check current queue
+            const queueDuplicate = state.invoices.some(inv => 
+                inv.invoiceNumber === invoiceNumber && 
+                inv.totalAmount === totalAmount
+            );
+            
+            // Check historical duplicates
+            const historicalDuplicate = isHistoricalDuplicate(invoiceNumber, totalAmount);
+            
+            return queueDuplicate || historicalDuplicate;
+        }
+
+        function handleFileUpload(event) {
+            const files = Array.from(event.target.files);
+            const newFiles = files.map((file, index) => ({
+                id: nextId++,
+                file,
+                name: file.name,
+                status: 'uploaded',
+                processed: false
+            }));
+            state.uploadedFiles = [...state.uploadedFiles, ...newFiles];
+            render();
+        }
+
+        async function processFiles() {
+            state.processingFiles = true;
+            state.processingProgress = {};
+            render();
+
+            for (let fileData of state.uploadedFiles) {
+                if (!fileData.processed) {
+                    try {
+                        state.processingProgress[fileData.id] = { status: 'processing', stage: 'Converting to base64...' };
+                        render();
+
+                        const base64Image = await fileToBase64(fileData.file);
+
+                        state.processingProgress[fileData.id] = { status: 'processing', stage: 'Calling Google Vision API...' };
+                        render();
+
+                        const visionResponse = await callGoogleVisionAPI(base64Image);
+
+                        state.processingProgress[fileData.id] = { status: 'processing', stage: 'Parsing invoice data...' };
+                        render();
+
+                        const extractedText = visionResponse.fullTextAnnotation?.text || '';
+                        const parsedData = parseInvoiceData(extractedText);
+
+                        const isDuplicate = checkDuplicate(parsedData.invoiceNumber, parsedData.totalAmount);
+
+                        const newInvoice = {
+                            id: nextId++,
+                            ...parsedData,
+                            filename: fileData.name,
+                            extractedText: extractedText,
+                            imageData: `data:${fileData.file.type};base64,${base64Image}`,
+                            isDuplicate: isDuplicate,
+                            processedAt: new Date().toISOString()
+                        };
+
+                        state.invoices.push(newInvoice);
+
+                        fileData.processed = true;
+                        fileData.status = 'processed';
+
+                        state.processingProgress[fileData.id] = { status: 'complete', stage: 'Complete ✅' };
+                        render();
+
+                    } catch (error) {
+                        console.error('Processing error:', error);
+                        fileData.status = 'error';
+                        state.processingProgress[fileData.id] = { status: 'error', stage: `Error: ${error.message}` };
+                        render();
+                    }
+                }
+            }
+
+            state.processingFiles = false;
+            setTimeout(() => {
+                state.uploadedFiles = [];
+                state.processingProgress = {};
+                render();
+            }, 3000);
+        }
+
+        function addTemplateRow() {
+            state.exportTemplate.push({
+                id: nextId++,
+                excelColumn: '',
+                invoiceField: '',
+                defaultValue: ''
+            });
+            render();
+        }
+
+        function updateTemplateRow(id, field, value) {
+            const row = state.exportTemplate.find(r => r.id === id);
+            if (row) {
+                row[field] = value;
+                render();
+            }
+        }
+
+        function removeTemplateRow(id) {
+            state.exportTemplate = state.exportTemplate.filter(r => r.id !== id);
+            render();
+        }
+
+        function moveTemplateRow(id, direction) {
+            const currentIndex = state.exportTemplate.findIndex(r => r.id === id);
+            if (currentIndex === -1) return;
+
+            let newIndex;
+            if (direction === 'up') {
+                newIndex = currentIndex - 1;
+            } else if (direction === 'down') {
+                newIndex = currentIndex + 1;
+            }
+
+            // Check bounds
+            if (newIndex < 0 || newIndex >= state.exportTemplate.length) return;
+
+            // Swap the rows
+            const temp = state.exportTemplate[currentIndex];
+            state.exportTemplate[currentIndex] = state.exportTemplate[newIndex];
+            state.exportTemplate[newIndex] = temp;
+
+            render();
+        }
+
+        function saveTemplate() {
+            localStorage.setItem('invoiceExportTemplate', JSON.stringify(state.exportTemplate));
+            alert('Template saved successfully!');
+        }
+
+        function loadTemplate() {
+            const saved = localStorage.getItem('invoiceExportTemplate');
+            if (saved) {
+                state.exportTemplate = JSON.parse(saved);
+                render();
+                alert('Template loaded successfully!');
+            }
+        }
+
+        function updateInvoice(invoiceId, field, value) {
+            const invoice = state.invoices.find(inv => inv.id === invoiceId);
+            if (invoice) {
+                const oldValue = invoice[field];
+                invoice[field] = value;
+                
+                if (state.selectedInvoice && state.selectedInvoice.id === invoiceId) {
+                    state.selectedInvoice = invoice;
+                }
+                
+                // Learn from any field changes
+                if (value !== oldValue && invoice.extractedText) {
+                    learnFromCorrection(invoice.extractedText, invoice);
+                    console.log(`✅ Learned ${field} for vendor:`, invoice.vendorName);
+                }
+                
+                // Re-render without affecting scroll position
+                renderWithoutScroll();
+            }
+        }
+
+        function renderWithoutScroll() {
+            const scrollPosition = document.documentElement.scrollTop || document.body.scrollTop;
+            render();
+            // Restore scroll position after render
+            setTimeout(() => {
+                document.documentElement.scrollTop = scrollPosition;
+                document.body.scrollTop = scrollPosition;
+            }, 0);
+        }
+
+        function deleteInvoice(invoiceId) {
+            if (confirm('Are you sure you want to delete this invoice?')) {
+                state.invoices = state.invoices.filter(inv => inv.id !== invoiceId);
+                if (state.selectedInvoice && state.selectedInvoice.id === invoiceId) {
+                    state.selectedInvoice = null;
+                }
+                render();
+            }
+        }
+
+        function clearAllInvoices() {
+            if (state.invoices.length === 0) {
+                alert('No invoices to clear!');
+                return;
+            }
+            
+            if (confirm(`Are you sure you want to clear all ${state.invoices.length} processed invoices? This action cannot be undone.`)) {
+                state.invoices = [];
+                state.selectedInvoice = null;
+                render();
+                alert('All invoices cleared successfully!');
+            }
+        }
+
+        function downloadInvoiceImage(invoice) {
+            const link = document.createElement('a');
+            link.href = invoice.imageData;
+            const filename = `${invoice.vendorName || 'Unknown'} - ${invoice.invoiceNumber || 'NoNumber'}.jpg`
+                .replace(/[^a-z0-9\s\-_.]/gi, '');
+            link.download = filename;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        }
+
+        function exportToCSV() {
+            if (state.invoices.length === 0) {
+                alert('No invoices to export!');
+                return;
+            }
+
+            // Add all invoices to historical duplicates before export
+            state.invoices.forEach(invoice => {
+                addToHistoricalDuplicates(invoice.invoiceNumber, invoice.totalAmount);
+            });
+
+            const headers = state.exportTemplate.map(t => t.excelColumn).filter(col => col);
+            const rows = state.invoices.map((invoice, index) => {
+                return state.exportTemplate.map(template => {
+                    if (!template.excelColumn) return '';
+                    
+                    // Handle Record ID field specially
+                    if (template.invoiceField === 'recordId') {
+                        return `="${index + 1}"`;
+                    }
+                    
+                    if (template.defaultValue) {
+                        return `="${template.defaultValue}"`;
+                    }
+                    
+                    const fieldValue = invoice[template.invoiceField] || '';
+                    return `="${fieldValue}"`;
+                });
+            });
+
+            const csvContent = [
+                headers.join(','),
+                ...rows.map(row => row.join(','))
+            ].join('\n');
+
+            const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement('a');
+            const url = URL.createObjectURL(blob);
+            link.setAttribute('href', url);
+            link.setAttribute('download', `Invoice_Export_${new Date().toISOString().split('T')[0]}.csv`);
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+
+            alert(`Exported ${state.invoices.length} invoices to CSV and added to duplicate protection!`);
+        }
+
+        function exportLearningData() {
+            if (Object.keys(state.learningData).length === 0) {
+                alert('No learning data to export yet. Process and correct some invoices first!');
+                return;
+            }
+
+            const dataStr = JSON.stringify(state.learningData, null, 2);
+            const blob = new Blob([dataStr], { type: 'application/json' });
+            const link = document.createElement('a');
+            const url = URL.createObjectURL(blob);
+            link.setAttribute('href', url);
+            link.setAttribute('download', `invoice-learning-data_${new Date().toISOString().split('T')[0]}.json`);
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+
+            alert(`Exported learning data for ${Object.keys(state.learningData).length} vendors!`);
+        }
+
+        function importLearningData(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                try {
+                    const importedData = JSON.parse(e.target.result);
+                    
+                    state.learningData = { ...state.learningData, ...importedData };
+                    saveLearningData();
+                    
+                    render();
+                    alert(`Successfully imported learning data for ${Object.keys(importedData).length} vendors!`);
+                } catch (error) {
+                    alert('Error importing learning data. Make sure the file is valid JSON.');
+                    console.error('Import error:', error);
+                }
+            };
+            reader.readAsText(file);
+            
+            event.target.value = '';
+        }
+
+        function render() {
+            const app = document.getElementById('app');
+            
+            app.innerHTML = `
+                <div class="min-h-screen bg-gray-50">
+                    <header class="bg-white shadow-sm border-b border-gray-200">
+                        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
+                            <div class="flex items-center justify-between">
+                                <div class="flex items-center">
+                                    <div class="w-12 h-12 bg-blue-600 rounded-lg flex items-center justify-center mr-3">
+                                        <i data-lucide="file-text" class="w-7 h-7 text-white"></i>
+                                    </div>
+                                    <div>
+                                        <h1 class="text-2xl font-bold text-gray-900">O'Brien County Implement</h1>
+                                        <p class="text-sm text-gray-600">AP Invoice Processor</p>
+                                    </div>
+                                </div>
+                                <div class="flex items-center space-x-4">
+                                    <div class="flex items-center space-x-2">
+                                        <button onclick="exportLearningData()" class="flex items-center px-3 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 text-sm">
+                                            <i data-lucide="download" class="w-4 h-4 mr-1"></i>
+                                            Export Learning
+                                        </button>
+                                        <label class="flex items-center px-3 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 text-sm cursor-pointer">
+                                            <i data-lucide="upload" class="w-4 h-4 mr-1"></i>
+                                            Import Learning
+                                            <input type="file" accept=".json" onchange="importLearningData(event)" class="hidden">
+                                        </label>
+                                        <button onclick="clearDuplicateHistory()" class="flex items-center px-3 py-2 bg-orange-600 text-white rounded-lg hover:bg-orange-700 text-sm">
+                                            <i data-lucide="history" class="w-4 h-4 mr-1"></i>
+                                            Clear History
+                                        </button>
+                                    </div>
+                                    <div class="text-right text-sm">
+                                        <div class="font-medium text-gray-900">${state.invoices.length} invoices</div>
+                                        <div class="text-xs text-gray-500">🧠 ${Object.keys(state.learningData).length} vendors learned</div>
+                                        <div class="text-xs text-gray-500">🛡️ ${Object.keys(state.duplicateHistory).length} historical duplicates</div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </header>
+
+                    <nav class="bg-white border-b border-gray-200">
+                        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                            <div class="flex space-x-8">
+                                <button onclick="state.activeTab='upload'; render();" class="py-4 px-1 border-b-2 font-medium text-sm ${state.activeTab === 'upload' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700'}">
+                                    Upload & Process
+                                </button>
+                                <button onclick="state.activeTab='mapping'; render();" class="py-4 px-1 border-b-2 font-medium text-sm ${state.activeTab === 'mapping' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700'}">
+                                    Excel Mapping
+                                </button>
+                                <button onclick="state.activeTab='invoices'; render();" class="py-4 px-1 border-b-2 font-medium text-sm ${state.activeTab === 'invoices' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700'}">
+                                    Processed Invoices
+                                </button>
+                            </div>
+                        </div>
+                    </nav>
+
+                    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+                        ${state.activeTab === 'upload' ? renderUploadTab() : ''}
+                        ${state.activeTab === 'mapping' ? renderMappingTab() : ''}
+                        ${state.activeTab === 'invoices' ? renderInvoicesTab() : ''}
+                    </main>
+
+                    ${state.selectedInvoice ? renderInvoiceModal() : ''}
+                </div>
+            `;
+
+            if (window.lucide) {
+                lucide.createIcons();
+            }
+        }
+
+        function renderUploadTab() {
+            return `
+                <div class="space-y-6">
+                    <div class="bg-white rounded-xl shadow-sm p-6">
+                        <h2 class="text-xl font-semibold text-gray-900 mb-4">Upload Invoice Images</h2>
+                        
+                        <div class="border-2 border-dashed border-gray-300 rounded-xl p-12 text-center hover:border-blue-400 transition-colors cursor-pointer bg-gray-50 hover:bg-blue-50" onclick="document.getElementById('fileInput').click()">
+                            <i data-lucide="upload" class="w-16 h-16 text-gray-400 mx-auto mb-4"></i>
+                            <p class="text-lg text-gray-700 mb-2">Click to upload invoice images</p>
+                            <p class="text-sm text-gray-500 mb-4">Supports: JPG, PNG, PDF</p>
+                        </div>
+                        <input type="file" id="fileInput" accept="image/*,.pdf" multiple onchange="handleFileUpload(event)" class="hidden">
+
+                        ${state.uploadedFiles.length > 0 ? `
+                            <div class="mt-6">
+                                <div class="flex justify-between items-center mb-4">
+                                    <h3 class="text-lg font-medium text-gray-800">
+                                        Processing Queue (${state.uploadedFiles.length} files)
+                                    </h3>
+                                    <button onclick="processFiles()" ${state.processingFiles || state.uploadedFiles.every(f => f.processed) ? 'disabled' : ''} class="flex items-center px-6 py-3 rounded-lg font-medium ${state.processingFiles || state.uploadedFiles.every(f => f.processed) ? 'bg-gray-400 text-gray-600 cursor-not-allowed' : 'bg-blue-600 text-white hover:bg-blue-700'}">
+                                        Process with Google Vision
+                                    </button>
+                                </div>
+
+                                <div class="space-y-3">
+                                    ${state.uploadedFiles.map(fileData => `
+                                        <div class="bg-gray-50 rounded-lg p-4 border border-gray-200">
+                                            <div class="flex items-center justify-between mb-2">
+                                                <span class="font-medium text-gray-900">${fileData.name}</span>
+                                                <span class="px-3 py-1 rounded-full text-xs font-medium ${
+                                                    fileData.status === 'processed' ? 'bg-green-100 text-green-700' :
+                                                    fileData.status === 'error' ? 'bg-red-100 text-red-700' :
+                                                    'bg-yellow-100 text-yellow-700'
+                                                }">
+                                                    ${fileData.status}
+                                                </span>
+                                            </div>
+
+                                            ${state.processingProgress[fileData.id] ? `
+                                                <div class="mt-2">
+                                                    <div class="text-sm text-gray-600 mb-1">
+                                                        ${state.processingProgress[fileData.id].stage}
+                                                    </div>
+                                                    <div class="w-full bg-gray-200 rounded-full h-2">
+                                                        <div class="h-2 rounded-full ${
+                                                            state.processingProgress[fileData.id].status === 'complete' ? 'bg-green-500' :
+                                                            state.processingProgress[fileData.id].status === 'error' ? 'bg-red-500' :
+                                                            'bg-blue-500 animate-pulse'
+                                                        }" style="width: ${state.processingProgress[fileData.id].status === 'complete' ? '100%' : '60%'}"></div>
+                                                    </div>
+                                                </div>
+                                            ` : ''}
+                                        </div>
+                                    `).join('')}
+                                </div>
+                            </div>
+                        ` : ''}
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderMappingTab() {
+            return `
+                <div class="bg-white rounded-xl shadow-sm p-6">
+                    <div class="flex justify-between items-center mb-6">
+                        <div>
+                            <h2 class="text-xl font-semibold text-gray-900">Excel Column Mapping</h2>
+                            <p class="text-sm text-gray-600">Map extracted invoice fields to your AP software Excel columns</p>
+                        </div>
+                        <div class="flex space-x-3">
+                            <button onclick="loadTemplate()" class="flex items-center px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 text-sm">
+                                <i data-lucide="upload" class="w-4 h-4 mr-2"></i>
+                                Load
+                            </button>
+                            <button onclick="addTemplateRow()" class="flex items-center px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm">
+                                <i data-lucide="plus" class="w-4 h-4 mr-2"></i>
+                                Add Column
+                            </button>
+                            <button onclick="saveTemplate()" class="flex items-center px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 text-sm">
+                                <i data-lucide="save" class="w-4 h-4 mr-2"></i>
+                                Save
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="border border-gray-200 rounded-lg overflow-hidden">
+                        <div class="bg-gray-50 px-4 py-3 border-b border-gray-200">
+                            <div class="grid grid-cols-12 gap-4 text-sm font-medium text-gray-700">
+                                <div class="col-span-3">Excel Column Name</div>
+                                <div class="col-span-4">Extracted Invoice Field</div>
+                                <div class="col-span-3">Default Value (Optional)</div>
+                                <div class="col-span-2">Actions</div>
+                            </div>
+                        </div>
+
+                        <div class="max-h-96 overflow-y-auto">
+                            ${state.exportTemplate.map((row, index) => `
+                                <div class="px-4 py-3 border-b border-gray-100">
+                                    <div class="grid grid-cols-12 gap-4 items-center">
+                                        <div class="col-span-3">
+                                            <input type="text" value="${row.excelColumn}" onchange="updateTemplateRow(${row.id}, 'excelColumn', this.value)" class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500" placeholder="Excel column name">
+                                        </div>
+                                        <div class="col-span-4">
+                                            <select onchange="updateTemplateRow(${row.id}, 'invoiceField', this.value)" class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500">
+                                                ${availableFields.map(field => `
+                                                    <option value="${field.value}" ${row.invoiceField === field.value ? 'selected' : ''}>${field.label}</option>
+                                                `).join('')}
+                                            </select>
+                                        </div>
+                                        <div class="col-span-3">
+                                            <input type="text" value="${row.defaultValue}" onchange="updateTemplateRow(${row.id}, 'defaultValue', this.value)" class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500" placeholder="e.g., 001" ${row.invoiceField === 'recordId' ? 'disabled' : ''}>
+                                        </div>
+                                        <div class="col-span-2">
+                                            <div class="flex items-center space-x-1">
+                                                <button onclick="moveTemplateRow(${row.id}, 'up')" ${index === 0 ? 'disabled' : ''} class="px-2 py-1 text-xs font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded border ${index === 0 ? 'opacity-30 cursor-not-allowed' : ''}" title="Move up">
+                                                    ↑
+                                                </button>
+                                                <button onclick="moveTemplateRow(${row.id}, 'down')" ${index === state.exportTemplate.length - 1 ? 'disabled' : ''} class="px-2 py-1 text-xs font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded border ${index === state.exportTemplate.length - 1 ? 'opacity-30 cursor-not-allowed' : ''}" title="Move down">
+                                                    ↓
+                                                </button>
+                                                <button onclick="removeTemplateRow(${row.id})" class="px-2 py-1 text-xs font-medium text-red-700 bg-red-100 hover:bg-red-200 rounded border" title="Delete row">
+                                                    ✕
+                                                </button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderInvoicesTab() {
+            return `
+                <div class="space-y-6">
+                    <div class="bg-white rounded-xl shadow-sm p-6">
+                        <div class="flex justify-between items-center mb-6">
+                            <div>
+                                <h2 class="text-xl font-semibold text-gray-900">Processed Invoices</h2>
+                                <p class="text-sm text-gray-600">${state.invoices.length} invoices ready for export</p>
+                            </div>
+                            ${state.invoices.length > 0 ? `
+                                <div class="flex space-x-3">
+                                    <button onclick="clearAllInvoices()" class="flex items-center px-6 py-3 bg-red-600 text-white rounded-lg hover:bg-red-700 font-medium">
+                                        <i data-lucide="trash-2" class="w-5 h-5 mr-2"></i>
+                                        Clear Queue
+                                    </button>
+                                    <button onclick="exportToCSV()" class="flex items-center px-6 py-3 bg-green-600 text-white rounded-lg hover:bg-green-700 font-medium">
+                                        <i data-lucide="download" class="w-5 h-5 mr-2"></i>
+                                        Export to CSV
+                                    </button>
+                                </div>
+                            ` : ''}
+                        </div>
+
+                        ${state.invoices.length === 0 ? `
+                            <div class="text-center py-16 text-gray-500">
+                                <i data-lucide="file-text" class="w-20 h-20 mx-auto mb-6 text-gray-300"></i>
+                                <p class="text-lg mb-2">No invoices processed yet</p>
+                                <p class="text-sm">Upload and process invoices to see them here</p>
+                            </div>
+                        ` : `
+                            <div class="space-y-3">
+                                ${state.invoices.map(invoice => `
+                                    <div class="bg-gray-50 rounded-lg p-4 border ${invoice.isDuplicate ? 'border-red-300 bg-red-50' : isInvoiceComplete(invoice) ? 'border-gray-200' : 'border-red-500 bg-red-50'}">
+                                        <div class="flex items-center justify-between">
+                                            <div class="flex-1">
+                                                <div class="flex items-center space-x-3 mb-2">
+                                                    <h3 class="font-medium text-gray-900">${invoice.vendorName || 'Unknown Vendor'}</h3>
+                                                    ${invoice.isDuplicate ? `
+                                                        <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-red-100 text-red-700">
+                                                            <i data-lucide="alert-circle" class="w-3 h-3 mr-1"></i>
+                                                            Duplicate
+                                                        </span>
+                                                    ` : ''}
+                                                    ${!isInvoiceComplete(invoice) ? `
+                                                        <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-orange-100 text-orange-700">
+                                                            <i data-lucide="alert-triangle" class="w-3 h-3 mr-1"></i>
+                                                            Incomplete
+                                                        </span>
+                                                    ` : ''}
+                                                </div>
+                                                <div class="grid grid-cols-4 gap-4 text-sm text-gray-600">
+                                                    <div><span class="font-medium">Vendor Code:</span> ${invoice.vendorCode || 'N/A'}</div>
+                                                    <div><span class="font-medium">Invoice #:</span> ${invoice.invoiceNumber || 'N/A'}</div>
+                                                    <div><span class="font-medium">Amount:</span> ${invoice.totalAmount || '0.00'}</div>
+                                                    <div><span class="font-medium">Date:</span> ${invoice.invoiceDate || 'N/A'}</div>
+                                                </div>
+                                                <div class="grid grid-cols-4 gap-4 text-sm text-gray-600 mt-2">
+                                                    <div><span class="font-medium">Due Date:</span> ${invoice.dueDate || 'N/A'}</div>
+                                                    <div><span class="font-medium">GL Account:</span> ${invoice.glAccount || 'N/A'}</div>
+                                                    <div><span class="font-medium">Area Code:</span> ${invoice.areaCode || 'N/A'}</div>
+                                                    <div><span class="font-medium">Discount:</span> ${invoice.discountAmount || 'N/A'}</div>
+                                                </div>
+                                            </div>
+                                            <div class="flex items-center space-x-2 ml-4">
+                                                <button onclick='downloadInvoiceImage(${JSON.stringify(invoice).replace(/'/g, "\\'")})'  class="flex items-center px-2 py-1 bg-blue-600 text-white rounded hover:bg-blue-700 text-sm">
+                                                    <i data-lucide="download" class="w-4 h-4 mr-1"></i>
+                                                    Save
+                                                </button>
+                                                <button onclick="state.selectedInvoice = state.invoices.find(inv => inv.id === ${invoice.id}); render();" class="flex items-center px-2 py-1 bg-gray-600 text-white rounded hover:bg-gray-700 text-sm">
+                                                    <i data-lucide="eye" class="w-4 h-4 mr-1"></i>
+                                                    Edit
+                                                </button>
+                                                <button onclick="deleteInvoice(${invoice.id})" class="flex items-center px-2 py-1 bg-red-600 text-white rounded hover:bg-red-700 text-sm">
+                                                    <i data-lucide="trash-2" class="w-4 h-4"></i>
+                                                </button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                `).join('')}
+                            </div>
+                        `}
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderInvoiceModal() {
+            if (!state.selectedInvoice) return '';
+            
+            return `
+                <div class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+                    <div class="bg-white rounded-xl max-w-5xl w-full overflow-hidden" style="max-height: 90vh;">
+                        <div class="p-6 border-b border-gray-200">
+                            <div class="flex items-center justify-between">
+                                <h2 class="text-xl font-semibold text-gray-900">Edit Invoice Data</h2>
+                                <button onclick="state.selectedInvoice = null; render();" class="text-gray-400 hover:text-gray-600 p-2">
+                                    <i data-lucide="x" class="w-6 h-6"></i>
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="p-6 overflow-y-auto" style="max-height: 70vh;">
+                            <div class="grid grid-cols-2 gap-6">
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700 mb-2">Invoice Image</label>
+                                    <div class="border border-gray-200 rounded-lg overflow-hidden bg-gray-50">
+                                        <img src="${state.selectedInvoice.imageData}" alt="Invoice" class="w-full h-auto">
+                                    </div>
+                                    <div class="mt-3">
+                                        <button onclick='downloadInvoiceImage(${JSON.stringify(state.selectedInvoice).replace(/'/g, "\\'")})'  class="w-full flex items-center justify-center px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm">
+                                            <i data-lucide="download" class="w-4 h-4 mr-2"></i>
+                                            Download Image
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div class="space-y-4">
+                                    <div class="bg-blue-50 border border-blue-200 rounded-lg p-3">
+                                        <div class="text-sm text-blue-800">
+                                            💡 <strong>Learning Mode:</strong> Your entries train the system
+                                        </div>
+                                    </div>
+
+                                    <div>
+                                        <label class="block text-sm font-medium text-gray-700 mb-2">Vendor Name</label>
+                                        <input type="text" value="${state.selectedInvoice.vendorName || ''}" onchange="updateInvoice(${state.selectedInvoice.id}, 'vendorName', this.value)" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500">
+                                    </div>
+
+                                    <div>
+                                        <label class="block text-sm font-medium text-gray-700 mb-2">Vendor Code</label>
+                                        <input type="text" value="${state.selectedInvoice.vendorCode || ''}" onchange="updateInvoice(${state.selectedInvoice.id}, 'vendorCode', this.value)" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" placeholder="e.g., VEND001">
+                                    </div>
+
+                                    <div>
+                                        <label class="block text-sm font-medium text-gray-700 mb-2">Invoice Number</label>
+                                        <input type="text" value="${state.selectedInvoice.invoiceNumber || ''}" onchange="updateInvoice(${state.selectedInvoice.id}, 'invoiceNumber', this.value)" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500">
+                                    </div>
+
+                                    <div class="grid grid-cols-2 gap-4">
+                                        <div>
+                                            <label class="block text-sm font-medium text-gray-700 mb-2">Invoice Date</label>
+                                            <input type="text" value="${state.selectedInvoice.invoiceDate || ''}" onchange="updateInvoice(${state.selectedInvoice.id}, 'invoiceDate', this.value)" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" placeholder="MM/DD/YYYY">
+                                        </div>
+                                        <div>
+                                            <label class="block text-sm font-medium text-gray-700 mb-2">Due Date</label>
+                                            <input type="text" value="${state.selectedInvoice.dueDate || ''}" onchange="updateInvoice(${state.selectedInvoice.id}, 'dueDate', this.value)" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" placeholder="MM/DD/YYYY">
+                                        </div>
+                                    </div>
+
+                                    <div>
+                                        <label class="block text-sm font-medium text-gray-700 mb-2">Total Amount</label>
+                                        <input type="text" value="${state.selectedInvoice.totalAmount || ''}" onchange="updateInvoice(${state.selectedInvoice.id}, 'totalAmount', this.value)" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" placeholder="0.00">
+                                    </div>
+
+                                    <div class="grid grid-cols-2 gap-4">
+                                        <div>
+                                            <label class="block text-sm font-medium text-gray-700 mb-2">GL Account (5 digits)</label>
+                                            <input type="text" value="${state.selectedInvoice.glAccount || ''}" onchange="updateInvoice(${state.selectedInvoice.id}, 'glAccount', this.value)" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" placeholder="e.g., 12345" maxlength="5">
+                                        </div>
+                                        <div>
+                                            <label class="block text-sm font-medium text-gray-700 mb-2">Area Code (3 digits)</label>
+                                            <input type="text" value="${state.selectedInvoice.areaCode || ''}" onchange="updateInvoice(${state.selectedInvoice.id}, 'areaCode', this.value)" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" placeholder="e.g., 123" maxlength="3">
+                                        </div>
+                                    </div>
+
+                                    <div class="grid grid-cols-2 gap-4">
+                                        <div>
+                                            <label class="block text-sm font-medium text-gray-700 mb-2">Discount Amount</label>
+                                            <input type="text" value="${state.selectedInvoice.discountAmount || ''}" onchange="updateInvoice(${state.selectedInvoice.id}, 'discountAmount', this.value)" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" placeholder="0.00">
+                                        </div>
+                                        <div>
+                                            <label class="block text-sm font-medium text-gray-700 mb-2">Discount % (not exported)</label>
+                                            <input type="text" value="${state.selectedInvoice.discountPercentage || ''}" onchange="updateInvoice(${state.selectedInvoice.id}, 'discountPercentage', this.value)" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" placeholder="e.g., 5">
+                                        </div>
+                                    </div>
+
+                                    ${state.selectedInvoice.isDuplicate ? `
+                                        <div class="bg-red-50 border border-red-200 rounded-lg p-4">
+                                            <div class="flex items-center">
+                                                <i data-lucide="alert-circle" class="w-5 h-5 text-red-500 mr-2"></i>
+                                                <div>
+                                                    <h4 class="font-medium text-red-900">Duplicate Detected</h4>
+                                                    <p class="text-sm text-red-700">This invoice already exists</p>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    ` : ''}
+
+                                    ${!isInvoiceComplete(state.selectedInvoice) ? `
+                                        <div class="bg-orange-50 border border-orange-200 rounded-lg p-4">
+                                            <div class="flex items-center">
+                                                <i data-lucide="alert-triangle" class="w-5 h-5 text-orange-500 mr-2"></i>
+                                                <div>
+                                                    <h4 class="font-medium text-orange-900">Incomplete Invoice</h4>
+                                                    <p class="text-sm text-orange-700">Required fields: Vendor Name, Invoice Number, Total Amount, Invoice Date</p>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    ` : ''}
+
+                                    <div class="bg-gray-50 rounded-lg p-4">
+                                        <h4 class="text-sm font-medium text-gray-700 mb-2">Extracted Text Preview</h4>
+                                        <div class="text-xs text-gray-600 overflow-y-auto whitespace-pre-line" style="max-height: 8rem;">
+                                            ${state.selectedInvoice.extractedText ? state.selectedInvoice.extractedText.substring(0, 300) + '...' : 'No text'}
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="p-6 border-t border-gray-200 bg-gray-50">
+                            <div class="flex justify-end space-x-3">
+                                <button onclick="state.selectedInvoice = null; render();" class="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700">
+                                    Cancel
+                                </button>
+                                <button onclick="state.selectedInvoice = null; render();" class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">
+                                    Save & Close
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        render();
+    </script>
+</body>
+</html>
