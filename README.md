@@ -13,7 +13,7 @@ Manual invoice data entry is time-consuming, error-prone, and costly for busines
 ## ✨ Key Features
 
 ### 🤖 AI-Powered Data Extraction
-- **Google Vision API Integration**: Uses advanced OCR to extract text from invoice images
+- **Google Vision API Integration**: Uses advanced OCR to extract text from invoice images. API Key replaced with placeholder text.
 - **Intelligent Field Detection**: Automatically identifies vendor names, invoice numbers, dates, amounts, and more
 - **Multi-Format Support**: Processes JPG, PNG, and PDF files
 
